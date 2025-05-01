@@ -711,6 +711,159 @@ class BrowserManager:
         except Exception as e:
             logger.error("Error closing browser: %s", str(e))
     
+    async def set_up_new_page_listener(self, original_page: Page, callback=None):
+        """
+        Set up a listener for new pages (tabs) that may open from the current page.
+        
+        Args:
+            original_page: The original page to associate with new tabs
+            callback: Optional callback function to execute when a new page is created
+                      Should accept (original_page, new_page) as parameters
+                      
+        Returns:
+            The listener function that was created
+        """
+        if not self.context:
+            logger.error("No browser context available for page listener")
+            return None
+            
+        # Store page reference for tracking purposes
+        if not hasattr(original_page, '_page_id'):
+            original_page._page_id = id(original_page)
+            
+        async def on_page(new_page):
+            try:
+                logger.info("New page detected, likely opened from original page")
+                
+                # Store reference to original page
+                new_page._opened_from = original_page._page_id
+                
+                # Wait for the new page to load
+                await new_page.wait_for_load_state("domcontentloaded", timeout=10000)
+                
+                # Execute callback if provided
+                if callback and callable(callback):
+                    try:
+                        await callback(original_page, new_page)
+                    except Exception as e:
+                        logger.error("Error in new page callback: %s", str(e))
+                        
+            except Exception as e:
+                logger.error("Error handling new page: %s", str(e))
+        
+        # Add the listener to the context
+        self.context.on("page", on_page)
+        logger.info("New page listener set up for context")
+        
+        return on_page
+    
+    async def handle_new_page(self, original_page: Page, new_page: Page, capture_data=True, close_after=True):
+        """
+        Handle a new page that was opened from interaction with original page.
+        
+        Args:
+            original_page: The original page that opened the new page
+            new_page: The newly opened page
+            capture_data: Whether to capture screenshot and page data
+            close_after: Whether to close the new page after capturing data
+            
+        Returns:
+            Dictionary with captured data from the new page
+        """
+        result = {}
+        
+        try:
+            logger.info("Handling new page at URL: %s", new_page.url)
+            
+            # Wait for page to be fully loaded
+            await new_page.wait_for_load_state("networkidle", timeout=15000)
+            
+            # Capture the URL
+            result["url"] = new_page.url
+            
+            # Take screenshot if requested
+            if capture_data:
+                # Create screenshot
+                screenshot_bytes = await new_page.screenshot()
+                result["screenshot"] = screenshot_bytes
+                
+                # Get page title
+                result["title"] = await new_page.title()
+                
+                # Capture page content if needed
+                result["html"] = await new_page.content()
+                
+                # Optionally capture more data here
+                logger.info("Captured data from new page: %s", new_page.url)
+            
+            # Close the new page if requested
+            if close_after:
+                await new_page.close()
+                logger.info("Closed new page after capturing data")
+            
+            return result
+            
+        except Exception as e:
+            logger.error("Error handling new page: %s", str(e))
+            
+            # Try to close the page to avoid leaking resources
+            try:
+                if close_after and new_page:
+                    await new_page.close()
+            except:
+                pass
+                
+            return {"error": str(e)}
+            
+    async def detect_popup_windows(self, page: Page, action_timeout=5000):
+        """
+        Detect if any popup windows appeared after an action.
+        
+        Args:
+            page: The page to check for popups
+            action_timeout: Time to wait for popups after action in ms
+            
+        Returns:
+            List of new pages that were detected
+        """
+        new_pages = []
+        
+        try:
+            # Create a future to capture any new pages
+            pages_future = asyncio.get_event_loop().create_future()
+            pages_detected = []
+            
+            def on_popup(page):
+                pages_detected.append(page)
+                if not pages_future.done():
+                    pages_future.set_result(True)
+            
+            # Set up the listener for the popup
+            self.context.on("page", on_popup)
+            
+            # Wait for the specified timeout or until a popup is detected
+            try:
+                await asyncio.wait_for(pages_future, timeout=action_timeout/1000)
+            except asyncio.TimeoutError:
+                logger.debug("No popups detected within timeout period")
+            
+            # Remove the listener to avoid memory leaks
+            self.context.remove_listener("page", on_popup)
+            
+            # Return the detected pages
+            new_pages = pages_detected
+            
+            # Add reference to parent page
+            for new_page in new_pages:
+                new_page._parent_page = page
+                logger.info("Detected new page/popup at URL: %s", await new_page.evaluate("location.href"))
+            
+            return new_pages
+        
+        except Exception as e:
+            logger.error("Error detecting popup windows: %s", str(e))
+            return []
+    
     async def scroll_to(self, page: Page, options: Dict = None) -> bool:
         """
         Scroll to different parts of the page with more control than scroll_page.

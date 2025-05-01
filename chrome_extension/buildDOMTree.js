@@ -1623,8 +1623,8 @@
                     } else {
                         interaction.action = 'setInputFiles';
                     }
-                } else if (type === 'submit') {
-                    // Submit buttons should use click
+                } else if (type === 'submit' || type === 'button') {
+                    // Submit and button inputs should use click
                     interaction.action = 'click';
                 } else if (['text', 'email', 'password', 'search', 'tel', 'url', 'number'].includes(type)) {
                     // Text input fields

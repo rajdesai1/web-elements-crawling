@@ -201,3 +201,4 @@ test_script_loading.py
 visualize_coordinates.py
 README_element_visualization.md
 src/config/settings.py
+data_new/

@@ -13,18 +13,18 @@ from pymongo import MongoClient
 from pathlib import Path
 from src.config.settings import (
     MONGODB_URI, MONGODB_DB_NAME, MONGODB_DOMAINS_COLLECTION, MONGODB_URLS_COLLECTION,
-    BATCH_SIZE, MAX_RETRIES, STATUS_PENDING
+     MAX_RETRIES, STATUS_PENDING
 )
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
 # Path to validated URLs file
-VALIDATED_URLS_FILE = "validated_urls.txt"
+VALIDATED_URLS_FILE = "data/urls_dump/validated_urls.txt"
 # Number of parallel processes to use (default: CPU count - 1)
-NUM_PROCESSES = max(1, multiprocessing.cpu_count() - 1)
+NUM_PROCESSES = 14
 # Number of lines to process per worker
-CHUNK_SIZE = 10000
+CHUNK_SIZE = 100
 
 def extract_domain_from_url(url):
     """Extract domain from URL"""

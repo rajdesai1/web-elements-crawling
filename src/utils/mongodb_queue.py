@@ -10,7 +10,7 @@ import sys
 import time
 import uuid
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 from urllib.parse import urlparse
 
 import pymongo
@@ -258,13 +258,13 @@ class DomainUrlManager:
             logger.error("Error adding URL %s to domain %s: %s", url, domain, str(e))
             return False
 
-    def add_urls_to_domain(self, domain: str, urls: List[str]) -> int:
+    def add_urls_to_domain(self, domain: str, urls: List[Union[str, Dict]]) -> int:
         """
         Add multiple URLs to a specific domain's queue.
         
         Args:
             domain: The domain these URLs belong to
-            urls: The URLs to add
+            urls: The URLs to add (either strings or dictionaries with url and metadata)
             
         Returns:
             Number of URLs successfully added
@@ -275,9 +275,21 @@ class DomainUrlManager:
         self.add_domain(domain)
         
         # Add each URL individually (could optimize with bulk operations if needed)
-        for url in urls:
-            if self.add_url_to_domain(domain, url):
-                count += 1
+        for url_item in urls:
+            # Handle both string URLs and dictionary objects
+            if isinstance(url_item, str):
+                # Simple string URL
+                if self.add_url_to_domain(domain, url_item):
+                    count += 1
+            elif isinstance(url_item, dict) and 'url' in url_item:
+                # Dictionary with URL and optional metadata
+                url = url_item.pop('url')  # Extract the URL
+                metadata = url_item  # Use remaining dict as metadata
+                
+                if self.add_url_to_domain(domain, url, metadata):
+                    count += 1
+            else:
+                logger.warning("Invalid URL item format: %s", url_item)
                 
         logger.info("Added %d new URLs to domain %s", count, domain)
         return count
@@ -930,6 +942,36 @@ class DomainUrlManager:
         except Exception as e:
             logger.error("Error getting active workers: %s", str(e))
             return workers
+
+    def get_all_domain_urls(self, domain: str, limit: int = 500, offset: int = 0) -> List[Dict]:
+        """
+        Get all URLs for a domain with pagination support.
+        
+        Args:
+            domain: The domain to get URLs for
+            limit: Maximum number of URLs to return
+            offset: Offset for pagination
+            
+        Returns:
+            List of URL data dictionaries
+        """
+        try:
+            # Find all URLs for the domain with pagination
+            cursor = self.urls_collection.find(
+                {"domain": domain},
+                {"url": 1, "status": 1, "is_discovered": 1}
+            ).skip(offset).limit(limit)
+            
+            results = []
+            for doc in cursor:
+                results.append(dict(doc))
+                
+            logger.debug("Got %d URLs for domain %s (offset: %d, limit: %d)", 
+                        len(results), domain, offset, limit)
+            return results
+        except Exception as e:
+            logger.error("Error getting all URLs for domain %s: %s", domain, str(e))
+            return []
 
 
 def load_validated_urls(file_path: str, batch_size: int = 1000) -> Dict[str, int]:

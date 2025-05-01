@@ -241,6 +241,8 @@ class ExtensionCrawler:
 
         # Track visited and discovered URLs to avoid duplicates
         visited_urls = set()
+        # Create a set to track all known URLs for this domain (both processed and queued)
+        known_urls = set()
         
         # Define batch size for URL retrieval
         batch_size = self.url_batch_size
@@ -249,6 +251,28 @@ class ExtensionCrawler:
         logger.info("Worker ID: %s, Task ID: %s", self.worker_id, task_id or "none")
         logger.info("Processing URLs in batches of %d (max concurrent: %d)", batch_size, DOMAIN_MAX_CONCURRENT_URLS)
         logger.info("Domain time limit: %d seconds", self.domain_time_limit_seconds)
+
+        # Get the initial set of URLs that are already in the queue
+        try:
+            # Get counts of URLs to estimate the size
+            url_counts = domain_manager.get_domain_urls_count(domain)
+            total_urls = url_counts.get('total', 0)
+            logger.info("Domain has %d total URLs in the queue", total_urls)
+            
+            # If there are URLs, we should pre-populate the known_urls set
+            # Use a larger batch size to efficiently get all URLs
+            if total_urls > 0:
+                # Get URL data in batches to avoid memory issues
+                initial_batch_size = min(500, total_urls)
+                for offset in range(0, total_urls, initial_batch_size):
+                    initial_urls = domain_manager.get_all_domain_urls(domain, limit=initial_batch_size, offset=offset)
+                    for url_data in initial_urls:
+                        url = url_data.get("url")
+                        if url:
+                            known_urls.add(url)
+                logger.info("Pre-populated known_urls with %d URLs from the queue", len(known_urls))
+        except Exception as e:
+            logger.warning("Error pre-populating known_urls set: %s", str(e))
 
         while len(processed_urls) < max_urls:
             # Check if we've reached the domain time limit
@@ -276,11 +300,17 @@ class ExtensionCrawler:
                 
                 for url_data in current_batch:
                     url = url_data.get("url")
+                    
+                    # Check if this URL has "is_discovered" flag to determine if it can discover new URLs
+                    # Default to False if not specified (meaning original queue URLs can discover)
+                    is_discovered = url_data.get("is_discovered", False)
+                    
                     if not url or url in visited_urls:
                         continue
                     
-                    # Add to visited set
+                    # Add to tracking sets
                     visited_urls.add(url)
+                    known_urls.add(url)
                     
                     # Create task for processing the URL
                     batch_tasks.append(self.process_url(
@@ -288,7 +318,9 @@ class ExtensionCrawler:
                         domain=domain,
                         task_id=task_id,
                         processed_urls=processed_urls,
-                        visited_urls=visited_urls
+                        visited_urls=visited_urls,
+                        known_urls=known_urls,
+                        is_discovered=is_discovered  # Pass the flag to process_url
                     ))
                 
                 # Wait for current batch of URLs to complete before processing next batch
@@ -310,7 +342,6 @@ class ExtensionCrawler:
                             # Check if any interactive elements were found
                             elements_count = len(result.get("elements", []))
                             processed_urls.add(url)
-                            visited_urls.add(url)  # Add to visited_urls set for proper tracking
                             
                             if elements_count > 0:
                                 logger.info("✅ Successfully processed URL with %d elements: %s", 
@@ -338,36 +369,54 @@ class ExtensionCrawler:
                                     "No interactive elements found on the page"
                                 )
 
-                            # Handle discovered URLs regardless of elements found
-                            new_urls = []
-                            for discovered_url in result.get("discovered_urls", []):
-                                # Clean URL before adding
-                                clean_url = self._clean_url(discovered_url)
-                                if not clean_url:
-                                    continue
+                            # Handle discovered URLs from original queue URLs only
+                            is_discovered = result.get("is_discovered", False)
+                            if is_discovered:
+                                logger.info("Skipping URL discovery for %s as it was discovered during crawling", url)
+                            else:
+                                # Only process discovered URLs if this was an original (non-discovered) URL
+                                new_urls = []
+                                unique_urls_count = 0
+                                
+                                for discovered_url in result.get("discovered_urls", []):
+                                    # Clean URL before adding
+                                    clean_url = self._clean_url(discovered_url)
+                                    if not clean_url:
+                                        continue
 
-                                # Skip already visited, processed, or queued URLs
-                                if (visited_urls is not None and clean_url in visited_urls) or \
-                                    (processed_urls is not None and clean_url in processed_urls):
-                                    continue
+                                    # Skip if URL is already known (visited, processed, or queued)
+                                    if clean_url in known_urls:
+                                        continue
+                                    
+                                    # Add to known URLs set to prevent duplicates
+                                    known_urls.add(clean_url)
+                                    unique_urls_count += 1
 
-                                # Add to domain manager in batches
-                                new_urls.append(clean_url)
+                                    # Mark the URL as discovered so it won't add more URLs to the queue
+                                    new_urls.append({"url": clean_url, "is_discovered": True})
 
-                            # Add new URLs in batches
-                            if new_urls:
-                                batch_size = 50  # Process URLs in batches for better performance
-                                for i in range(0, len(new_urls), batch_size):
-                                    batch = new_urls[i : i + batch_size]
-                                    added_count = self._add_urls_to_domain(domain, batch)
+                                logger.info("Found %d unique new URLs from %d discovered URLs", 
+                                           unique_urls_count, len(result.get("discovered_urls", [])))
+                                
+                                # limit new urls to 10
+                                # random shuffle the new urls
+                                random.shuffle(new_urls)
+                                new_urls = new_urls[:10]
 
-                                discovered_urls_count += len(new_urls)
-                                logger.info(
-                                    "Added %d new URLs to domain %s (total discovered: %d)",
-                                    len(new_urls),
-                                    domain,
-                                    discovered_urls_count,
-                                )
+                                # Add new URLs with the is_discovered flag
+                                if new_urls:
+                                    batch_size = 10  # Process URLs in batches for better performance
+                                    for i in range(0, len(new_urls), batch_size):
+                                        batch = new_urls[i : i + batch_size]
+                                        added_count = self._add_urls_to_domain(domain, batch)
+
+                                    discovered_urls_count += len(new_urls)
+                                    logger.info(
+                                        "Added %d new URLs to domain %s (total discovered: %d)",
+                                        len(new_urls),
+                                        domain,
+                                        discovered_urls_count,
+                                    )
                         else:
                             failed_urls.append(url)
                             logger.warning("❌ Failed to process URL: %s", url)
@@ -396,7 +445,8 @@ class ExtensionCrawler:
             "urls_per_second": (
                 len(processed_urls) / processing_time if processing_time > 0 else 0
             ),
-            "time_limit_reached": processing_time >= self.domain_time_limit_seconds
+            "time_limit_reached": processing_time >= self.domain_time_limit_seconds,
+            "unique_urls_tracked": len(known_urls)
         }
 
         logger.info("📊 Completed processing domain: %s", domain)
@@ -404,13 +454,13 @@ class ExtensionCrawler:
 
         return statistics
 
-    def _add_urls_to_domain(self, domain: str, urls: List[str]) -> int:
+    def _add_urls_to_domain(self, domain: str, urls: List[Union[str, Dict]]) -> int:
         """
         Add URLs to a domain's queue.
 
         Args:
             domain: Domain to add URLs to
-            urls: List of URLs to add
+            urls: List of URLs to add (either string URLs or dicts with 'url' and 'is_discovered' keys)
 
         Returns:
             Number of URLs added
@@ -424,7 +474,9 @@ class ExtensionCrawler:
     async def process_url(self, url: str, domain: str, 
                      task_id: Optional[str] = None,
                      processed_urls: Optional[Set[str]] = None,
-                     visited_urls: Optional[Set[str]] = None) -> Dict:
+                     visited_urls: Optional[Set[str]] = None,
+                     known_urls: Optional[Set[str]] = None,
+                     is_discovered: bool = False) -> Dict:
         """
         Process a single URL for interactive elements and collect discovered URLs.
 
@@ -434,6 +486,8 @@ class ExtensionCrawler:
             task_id: Optional task ID for tracking
             processed_urls: Optional set of processed URLs for tracking
             visited_urls: Optional set of visited URLs for tracking
+            known_urls: Optional set of known URLs for tracking
+            is_discovered: Flag indicating if this URL was discovered during crawling
 
         Returns:
             Dictionary containing processed elements and discovered URLs
@@ -446,6 +500,7 @@ class ExtensionCrawler:
             "error": None,
             "elements": [],
             "discovered_urls": [],
+            "is_discovered": is_discovered
         }
 
         # Initialize tracking sets if not provided
@@ -453,6 +508,8 @@ class ExtensionCrawler:
             processed_urls = set()
         if visited_urls is None:
             visited_urls = set()
+        if known_urls is None:
+            known_urls = set()
             
         # Initialize discovered URLs counter
         discovered_urls_count = 0
@@ -789,42 +846,51 @@ class ExtensionCrawler:
                     "No interactive elements found on the page"
                 )
 
-            # Handle discovered URLs regardless of elements found
-            new_urls = []
-            for discovered_url in result.get("discovered_urls", []):
-                # Clean URL before adding
-                clean_url = self._clean_url(discovered_url)
-                if not clean_url:
-                    continue
+            # Handle discovered URLs from original queue URLs only
+            is_discovered = result.get("is_discovered", False)
+            if is_discovered:
+                logger.info("Skipping URL discovery for %s as it was discovered during crawling", url)
+            else:
+                # Only process discovered URLs if this was an original (non-discovered) URL
+                new_urls = []
+                for discovered_url in result.get("discovered_urls", []):
+                    # Clean URL before adding
+                    clean_url = self._clean_url(discovered_url)
+                    if not clean_url:
+                        continue
 
-                # Skip already visited, processed, or queued URLs
-                if (visited_urls is not None and clean_url in visited_urls) or \
-                   (processed_urls is not None and clean_url in processed_urls):
-                    continue
+                    # Skip if URL is already known (visited, processed, or queued)
+                    if clean_url in known_urls:
+                        continue
+                    
+                    # Add to known URLs set to prevent duplicates
+                    known_urls.add(clean_url)
 
-                # Add to domain manager in batches
-                new_urls.append(clean_url)
+                    # Mark the URL as discovered so it won't add more URLs to the queue
+                    new_urls.append({"url": clean_url, "is_discovered": True})
 
-            # limit new urls to 10
-            # random shuffle the new urls
-            random.shuffle(new_urls)
-            new_urls = new_urls[:10]
-            
+                logger.info("Found %d unique new URLs from %d discovered URLs", 
+                           len(new_urls), len(result.get("discovered_urls", [])))
+                
+                # limit new urls to 10
+                # random shuffle the new urls
+                random.shuffle(new_urls)
+                new_urls = new_urls[:10]
 
-            # Add new URLs in batches
-            if new_urls:
-                batch_size = 10  # Process URLs in batches for better performance
-                for i in range(0, len(new_urls), batch_size):
-                    batch = new_urls[i : i + batch_size]
-                    added_count = self._add_urls_to_domain(domain, batch)
+                # Add new URLs with the is_discovered flag
+                if new_urls:
+                    batch_size = 10  # Process URLs in batches for better performance
+                    for i in range(0, len(new_urls), batch_size):
+                        batch = new_urls[i : i + batch_size]
+                        added_count = self._add_urls_to_domain(domain, batch)
 
-                discovered_urls_count += len(new_urls)
-                logger.info(
-                    "Added %d new URLs to domain %s (total discovered: %d)",
-                    len(new_urls),
-                    domain,
-                    discovered_urls_count,
-                )
+                    discovered_urls_count += len(new_urls)
+                    logger.info(
+                        "Added %d new URLs to domain %s (total discovered: %d)",
+                        len(new_urls),
+                        domain,
+                        discovered_urls_count,
+                    )
         else:
             # Handle failed URL processing (including timeouts)
             logger.warning("❌ Failed to process URL: %s - %s", url, result.get("error", "Unknown error"))
@@ -1356,65 +1422,272 @@ class ExtensionCrawler:
                     interaction_type="click_before"
                 )
                 
+                # Initialize after_interaction to avoid "referenced before assignment" error
+                after_interaction = None
+                interaction_success = False
+                
                 try:
-                    # Click the element and handle potential navigation
-                    async with page.expect_navigation(timeout=REDIRECT_TIMEOUT_MS) as navigation_info:
-                        await locator.click(delay=random.randint(50, 150))
-                        
+                    # Get the current number of pages in the context before clicking
+                    pre_click_pages = page.context.pages
+                    pre_click_page_count = len(pre_click_pages)
+                    pre_click_page_urls = {p.url for p in pre_click_pages}
+                    
+                    # Set up a promise for navigation in current page
+                    navigation_promise = None
+                    try:
+                        navigation_promise = page.wait_for_navigation(timeout=REDIRECT_TIMEOUT_MS)
+                    except Exception:
+                        pass
+                    
+                    # DUAL APPROACH: Use both event-based and page comparison methods
+                    # 1. Event-based approach for immediate detection
+                    popup_future = asyncio.get_event_loop().create_future()
+                    
+                    # Define a handler that will be called when a popup is created
+                    def on_popup(popup_page):
+                        logger.info("Popup event detected for element: %s", element_id)
+                        if not popup_future.done():
+                            popup_future.set_result(popup_page)
+                    
+                    # Register the popup event handler on this specific page
+                    page.on("popup", on_popup)
+                    
+                    # Click the element
+                    await locator.click(delay=random.randint(50, 150))
+                    
+                    # Wait a short time for any new page or navigation to occur
+                    await asyncio.sleep(0.5)
+                    
+                    # Check for popup using the event handler
+                    popup = None
+                    try:
+                        # Wait for up to 2 seconds for popup event
+                        popup = await asyncio.wait_for(popup_future, timeout=2)
+                        logger.info("Popup detected via event after clicking: %s", element_id)
+                    except asyncio.TimeoutError:
+                        logger.debug("No popup detected via event after clicking: %s", element_id)
+                    except Exception as e:
+                        logger.warning("Error checking for popup via event: %s", str(e))
+                    finally:
+                        # Always remove the listener to avoid memory leaks
                         try:
-                            result = await navigation_info.value
-                            if result:
-                                redirect_count += 1
-                                logger.info("Navigation occurred (%d/%d): %s -> %s", 
-                                        redirect_count, MAX_REDIRECTS_PER_INTERACTION,
-                                        original_url, result.url)
-                                
-                                interaction_data["redirects"].append({
-                                    "from_url": original_url,
-                                    "to_url": result.url,
-                                    "redirect_number": redirect_count
-                                })
-                                
-                                page_changed = True
-                                
-                                # Check redirect limit
-                                if redirect_count >= MAX_REDIRECTS_PER_INTERACTION:
-                                    logger.info("Reached maximum redirects limit (%d)", MAX_REDIRECTS_PER_INTERACTION)
-                                    break
-                                
-                                # Wait for the page to stabilize
-                                await page.wait_for_load_state("domcontentloaded")
-                    
-                                # Capture state after navigation
-                                after_interaction = await self._capture_interaction_state(
-                                    page=page,
-                                    element_id=element_id,
-                                    element_path=element_path,
-                                    tag_name=tag_name,
-                                    element_type=element_type,
-                                    interaction_type="click_after_navigation",
-                                    extra_data={
-                                        "navigation": {
-                                            "from_url": original_url,
-                                            "to_url": result.url,
-                                            "redirect_number": redirect_count
-                                        },
-                                        "before_storage_path": before_interaction["storage_path"]
-                                    }
-                    )
-                    
-                                # If we want to continue with original page
-                                if RETURN_TO_ORIGINAL_URL:
-                                    try:
-                                        await page.goto(original_url, timeout=REDIRECT_TIMEOUT_MS)
-                                        await page.wait_for_load_state("domcontentloaded")
-                                        page_changed = False  # Reset flag since we're back
-                                    except Exception as e:
-                                        logger.error("Failed to return to original URL: %s", str(e))
-                                        break  # Stop processing if we can't return
+                            page.remove_listener("popup", on_popup)
+                        except Exception as e:
+                            logger.warning("Error removing popup listener: %s", str(e))
                             
-                        except Exception:
-                            # No navigation occurred, capture normal after state
+                    # If no popup was detected via event, use page comparison as backup
+                    if not popup:
+                        # 2. Page comparison approach as fallback
+                        try:
+                            # Get current pages after click
+                            post_click_pages = page.context.pages
+                            
+                            # Check if we have new pages
+                            if len(post_click_pages) > pre_click_page_count:
+                                # Find new pages that weren't there before
+                                for new_p in post_click_pages:
+                                    if new_p not in pre_click_pages:
+                                        logger.info("New page detected via comparison after clicking: %s", element_id)
+                                        popup = new_p
+                                        break
+                        except Exception as e:
+                            logger.warning("Error in page comparison method: %s", str(e))
+                    
+                    # Process the popup if detected (by either method)
+                    if popup:
+                        try:
+                            # Wait for the popup to load
+                            await popup.wait_for_load_state("domcontentloaded", timeout=REDIRECT_TIMEOUT_MS)
+                            
+                            # Now we can safely access the URL
+                            popup_url = popup.url
+                            logger.info("Popup URL: %s", popup_url)
+                            
+                            # Take screenshot of the popup
+                            popup_screenshot = await capture_high_quality_screenshot(
+                                popup, self.storage_manager.screenshot_quality
+                            )
+                            
+                            # Collect interactive elements data from popup
+                            popup_elements = await self.browser_manager.detect_interactive_elements(popup)
+                            
+                            # Store information about popup
+                            interaction_data["new_tab"] = {
+                                "url": popup_url,
+                                "title": await popup.title(),
+                                "element_count": len(popup_elements.get("interactiveElements", [])),
+                                "screenshot_taken": bool(popup_screenshot)
+                            }
+                            
+                            # Also collect any URLs from this popup
+                            if hasattr(self, 'extract_urls_from_elements'):
+                                try:
+                                    popup_urls = await self.extract_urls_from_elements(
+                                        popup_elements.get("interactiveElements", []), 
+                                        popup_url
+                                    )
+                                    interaction_data["new_tab"]["discovered_urls"] = popup_urls
+                                except Exception as e:
+                                    logger.warning("Failed to extract URLs from popup: %s", str(e))
+                            
+                            # Save the screenshot to storage
+                            if popup_screenshot:
+                                # Create a popup screenshot directory
+                                popup_id = f"popup_{self._generate_unique_element_id(element_id, tag_name, element_type, 'popup')}"
+                                popup_dir = self.storage_manager.create_directory_structure(popup_url, popup_id, "popup")
+                                popup_screenshot_path = popup_dir / f"{popup_id}.png"
+                                
+                                # Save screenshot directly
+                                screenshot_saved = self.storage_manager.save_screenshot(popup_screenshot_path, popup_screenshot)
+                                if screenshot_saved:
+                                    interaction_data["new_tab"]["screenshot_path"] = str(popup_screenshot_path)
+                                else:
+                                    logger.warning("Failed to save popup screenshot")
+
+
+                                
+                            # For popups, we still need to capture after interaction state of the original page
+                            after_interaction = await self._capture_interaction_state(
+                                page=page,
+                                element_id=element_id,
+                                element_path=element_path,
+                                tag_name=tag_name,
+                                element_type=element_type,
+                                interaction_type="click_after_popup",
+                                extra_data={
+                                    "before_storage_path": before_interaction["storage_path"],
+                                    "popup_processed": True
+                                }
+                            )
+                            
+                            # Close the popup after processing it
+                            await popup.close()
+                            logger.info("Closed popup after capturing data")
+                            
+                            interaction_success = True
+                            click_interactions += 1
+                            total_interactions += 1
+                            successful_interactions += 1
+                            interaction_data = after_interaction
+                            
+                        except Exception as e:
+                            logger.error("Error processing popup: %s", str(e))
+                            # Still try to close the popup to avoid resource leaks
+                            try:
+                                if popup:
+                                    await popup.close()
+                            except Exception:
+                                pass
+                    else:
+                        # If no popup was processed, check if navigation occurred in current page
+                        try:
+                            # Check if the navigation promise was fulfilled
+                            if navigation_promise:
+                                result = await navigation_promise
+                                if result:
+                                    redirect_count += 1
+                                    logger.info("Navigation occurred (%d/%d): %s -> %s", 
+                                            redirect_count, MAX_REDIRECTS_PER_INTERACTION,
+                                            original_url, result.url)
+                                    
+                                    interaction_data["redirects"].append({
+                                        "from_url": original_url,
+                                        "to_url": result.url,
+                                        "redirect_number": redirect_count
+                                    })
+                                    
+                                    page_changed = True
+                                    
+                                    # Check redirect limit
+                                    if redirect_count >= MAX_REDIRECTS_PER_INTERACTION:
+                                        logger.info("Reached maximum redirects limit (%d)", MAX_REDIRECTS_PER_INTERACTION)
+                                        break
+                                    
+                                    # Wait for the page to stabilize
+                                    await page.wait_for_load_state("domcontentloaded")
+                            
+                                    # Capture state after navigation
+                                    after_interaction = await self._capture_interaction_state(
+                                        page=page,
+                                        element_id=element_id,
+                                        element_path=element_path,
+                                        tag_name=tag_name,
+                                        element_type=element_type,
+                                        interaction_type="click_after_navigation",
+                                        extra_data={
+                                            "navigation": {
+                                                "from_url": original_url,
+                                                "to_url": result.url,
+                                                "redirect_number": redirect_count
+                                            },
+                                            "before_storage_path": before_interaction["storage_path"]
+                                        }
+                                    )
+                                    
+                                    # If using original page and it changed, return to original URL if needed
+                                    if page_changed and RETURN_TO_ORIGINAL_URL:
+                                        try:
+                                            await page.goto(original_url, timeout=REDIRECT_TIMEOUT_MS)
+                                            await page.wait_for_load_state("domcontentloaded")
+                                            page_changed = False  # Reset flag since we're back
+                                        except Exception as e:
+                                            logger.error("Failed to return to original URL: %s", str(e))
+                                            break
+                                else:
+                                    # Check if URL changed without navigation promise being fulfilled
+                                    current_url = page.url
+                                    if current_url != original_url:
+                                        redirect_count += 1
+                                        logger.info("URL changed without navigation event (%d/%d): %s -> %s", 
+                                                redirect_count, MAX_REDIRECTS_PER_INTERACTION,
+                                                original_url, current_url)
+                                        
+                                        page_changed = True
+                                        
+                                        # Capture state after URL change
+                                        after_interaction = await self._capture_interaction_state(
+                                            page=page,
+                                            element_id=element_id,
+                                            element_path=element_path,
+                                            tag_name=tag_name,
+                                            element_type=element_type,
+                                            interaction_type="click_after_url_change",
+                                            extra_data={
+                                                "navigation": {
+                                                    "from_url": original_url,
+                                                    "to_url": current_url,
+                                                    "redirect_number": redirect_count
+                                                },
+                                                "before_storage_path": before_interaction["storage_path"]
+                                            }
+                                        )
+                                        
+                                        # Return to original URL if needed
+                                        if RETURN_TO_ORIGINAL_URL:
+                                            try:
+                                                await page.goto(original_url, timeout=REDIRECT_TIMEOUT_MS)
+                                                await page.wait_for_load_state("domcontentloaded")
+                                                page_changed = False  # Reset flag since we're back
+                                            except Exception as e:
+                                                logger.error("Failed to return to original URL: %s", str(e))
+                                            break
+                                    else:
+                                        # No navigation or URL change, just capture current state
+                                        await page.wait_for_timeout(random.randint(500, 1000))
+                                        after_interaction = await self._capture_interaction_state(
+                                            page=page,
+                                            element_id=element_id,
+                                            element_path=element_path,
+                                            tag_name=tag_name,
+                                            element_type=element_type,
+                                            interaction_type="click_after",
+                                            extra_data={
+                                                "before_storage_path": before_interaction["storage_path"]
+                                            }
+                                        )
+                        except Exception as e:
+                            logger.warning("Error checking navigation: %s", str(e))
+                            # No navigation occurred or error checking it, capture normal after state
                             await page.wait_for_timeout(random.randint(500, 1000))
                             after_interaction = await self._capture_interaction_state(
                                 page=page,
@@ -1427,15 +1700,14 @@ class ExtensionCrawler:
                                     "before_storage_path": before_interaction["storage_path"]
                                 }
                             )
-                            
-                            total_interactions += 1   ## Putting this here to avoid infinte waiting or processing of all the interactive elements
-                    
-                    interaction_success = True
-                    click_interactions += 1
-                    total_interactions += 1
-                    successful_interactions += 1
-                    interaction_data = after_interaction
-                    
+                        
+                        if after_interaction is not None:  # Only update if we have a valid result
+                            interaction_success = True
+                            click_interactions += 1
+                            total_interactions += 1
+                            successful_interactions += 1
+                            interaction_data = after_interaction
+                
                 except Exception as e:
                     logger.warning("Click interaction failed: %s - %s", element_id, str(e))
                     interaction_data["error"] = str(e)
@@ -1450,10 +1722,13 @@ class ExtensionCrawler:
                         except Exception as nav_error:
                             logger.error("Failed to return to original URL after interaction error: %s", str(nav_error))
                     
-                    total_interactions += 1  ## Putting this here to avoid infinte waiting or processing of all the interactive elements
+                    if not interaction_success:
+                        total_interactions += 1  # Count failed interactions too
                 
-                # Store the interaction result
+                # Store the interaction result regardless of success
                 interaction_results.append(interaction_data)
+                
+                # Mark this element as interacted with to avoid duplicates
                 interacted_elements.add(element_path)
                 
                 # Pause between interactions
