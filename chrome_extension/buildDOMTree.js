@@ -3,7 +3,7 @@
     // Store the result in a global variable for console access
     window.domTreeResult = (
         args = {
-            doHighlightElements: true, // CHANGED: Default to false
+            doHighlightElements: false, // CHANGED: Default to false
             focusHighlightIndex: -1,
             viewportExpansion: 0,
             debugMode: false, // Changed from False to false

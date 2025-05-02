@@ -2,7 +2,7 @@
 window.analyzer = function(options) {
   // Default parameters
   const params = {
-    doHighlightElements: true,
+    doHighlightElements: false,
     focusHighlightIndex: -1,
     viewportExpansion: 0,
     debugMode: false,
